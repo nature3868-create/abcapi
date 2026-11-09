@@ -1,0 +1,91 @@
+name: Windows localization permissions validation
+on:
+  push:
+    branches: [codex/windows-localization-validation-0112]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows-powershell-51:
+    runs-on: windows-2025
+    timeout-minutes: 10
+    steps:
+      - name: Verify isolated Windows permission recovery
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($PSVersionTable.PSEdition -ne 'Desktop' -or $PSVersionTable.PSVersion.Major -ne 5) { throw 'This fixture requires Windows PowerShell 5.1.' }
+          Add-Type @'
+          using System;
+          using System.ComponentModel;
+          using System.Runtime.InteropServices;
+          public static class AbcFixturePrivilege {
+            [StructLayout(LayoutKind.Sequential)] struct LUID { public uint Low; public int High; }
+            [StructLayout(LayoutKind.Sequential)] struct TP { public uint Count; public LUID Luid; public uint Attributes; }
+            [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+            [DllImport("kernel32.dll", SetLastError=true)] static extern bool CloseHandle(IntPtr h);
+            [DllImport("advapi32.dll", SetLastError=true)] static extern bool OpenProcessToken(IntPtr p, uint a, out IntPtr t);
+            [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool LookupPrivilegeValue(string s, string n, out LUID l);
+            [DllImport("advapi32.dll", SetLastError=true)] static extern bool AdjustTokenPrivileges(IntPtr t, bool d, ref TP p, uint z, IntPtr o, IntPtr r);
+            public static void Enable(string name) {
+              IntPtr token;
+              if (!OpenProcessToken(GetCurrentProcess(), 0x28, out token)) throw new Win32Exception();
+              try {
+                LUID luid;
+                if (!LookupPrivilegeValue(null, name, out luid)) throw new Win32Exception();
+                TP tp = new TP { Count=1, Luid=luid, Attributes=2 };
+                if (!AdjustTokenPrivileges(token, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero)) throw new Win32Exception();
+                int error = Marshal.GetLastWin32Error();
+                if (error != 0) throw new Win32Exception(error);
+              } finally { CloseHandle(token); }
+            }
+          }
+          '@
+          $parent = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\') + '\'
+          $lab = Join-Path $parent ('abcapi-acl-fixture-' + [guid]::NewGuid().ToString('N'))
+          if (-not ([IO.Path]::GetFullPath($lab)).StartsWith($parent, [StringComparison]::OrdinalIgnoreCase)) { throw 'Unsafe fixture root.' }
+          New-Item -ItemType Directory -Path $lab | Out-Null
+          $file = Join-Path $lab 'fixture.txt'
+          $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+          $system = [Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+          $sections = [Security.AccessControl.AccessControlSections]::Owner -bor [Security.AccessControl.AccessControlSections]::Group -bor [Security.AccessControl.AccessControlSections]::Access
+          $initial = $null
+          try {
+            [IO.File]::WriteAllText($file, 'original-fixture')
+            $initial = (Get-Acl -LiteralPath $file).GetSecurityDescriptorSddlForm($sections)
+            [AbcFixturePrivilege]::Enable('SeRestorePrivilege')
+            [AbcFixturePrivilege]::Enable('SeTakeOwnershipPrivilege')
+            $locked = [Security.AccessControl.FileSecurity]::new()
+            $locked.SetAccessRuleProtection($true, $false)
+            $locked.SetOwner($system)
+            $locked.SetGroup($system)
+            $locked.AddAccessRule(([Security.AccessControl.FileSystemAccessRule]::new($system, 'FullControl', 'Allow')))
+            $locked.AddAccessRule(([Security.AccessControl.FileSystemAccessRule]::new($sid, 'ReadAndExecute', 'Allow')))
+            Set-Acl -LiteralPath $file -AclObject $locked
+            $before = (Get-Acl -LiteralPath $file).GetSecurityDescriptorSddlForm($sections)
+            $denied = $false
+            try { $s = [IO.File]::Open($file, [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite); $s.Dispose() } catch { $denied = $true }
+            if (-not $denied) { throw 'The permission fixture did not actually reject writes.' }
+            $owner = Get-Acl -LiteralPath $file
+            $owner.SetOwner($sid)
+            Set-Acl -LiteralPath $file -AclObject $owner
+            $temporary = Get-Acl -LiteralPath $file
+            $temporary.AddAccessRule(([Security.AccessControl.FileSystemAccessRule]::new($sid, 'Modify', 'Allow')))
+            Set-Acl -LiteralPath $file -AclObject $temporary
+            [IO.File]::WriteAllText($file, 'patched-fixture')
+            $restore = [Security.AccessControl.FileSecurity]::new()
+            $restore.SetSecurityDescriptorSddlForm($before, $sections)
+            Set-Acl -LiteralPath $file -AclObject $restore
+            $after = (Get-Acl -LiteralPath $file).GetSecurityDescriptorSddlForm($sections)
+            if ($after -cne $before) { throw 'Owner/group/DACL restoration did not match.' }
+            if ((Get-Acl -LiteralPath $file).GetOwner([Security.Principal.SecurityIdentifier]).Value -ne 'S-1-5-18') { throw 'The original SYSTEM owner was not restored.' }
+            if ([IO.File]::ReadAllText($file) -cne 'patched-fixture') { throw 'Fixture content write was lost.' }
+            Write-Output 'PASS: Windows PowerShell 5.1; real write denial; temporary access; exact SYSTEM owner/group/DACL restoration. Temporary files only.'
+          } finally {
+            if ($initial -and (Test-Path -LiteralPath $file)) {
+              $cleanup = [Security.AccessControl.FileSecurity]::new()
+              $cleanup.SetSecurityDescriptorSddlForm($initial, $sections)
+              Set-Acl -LiteralPath $file -AclObject $cleanup
+            }
+            if (Test-Path -LiteralPath $lab) { Remove-Item -LiteralPath $lab -Recurse -Force }
+          }
